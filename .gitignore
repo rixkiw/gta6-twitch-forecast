@@ -1,0 +1,10 @@
+/input/
+/out/
+/output/
+/fixtures/
+/node_modules/
+*.log
+*.out
+*.tsbuildinfo
+/coverage/
+/.cache/

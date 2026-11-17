@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { selectWidth, compress } from './calibration.ts';
 
 export const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
 export const DEFAULT_CONFIG = Object.freeze({ bandwidth: 1.5, context: true, metadata: true });
@@ -25,15 +26,29 @@ export function metadata(unlock = '', platforms = '') {
   return [console && !pc ? 1 : 0, rolling ? 1 : 0, early ? 1 : 0];
 }
 
+export function launchPlatforms(notes = '') {
+  const text = String(notes).split(/Source:|Tier:|Research note:/i)[0];
+  return text.match(/\breleased\s+[^;\n]*?\s+on\s+([^();\n]+?)(?=\s*\(|;|\.(?:\s|$)|$)/i)?.[1]?.trim() ?? '';
+}
+
+export function targetMetadata(input) {
+  const unlock = input.unlock ?? String(input.notes ?? '').match(/\b(?:real\s+)?unlock:\s*([\s\S]*)/i)?.[1] ?? '';
+  return metadata(unlock, input.platforms ?? input.game?.platforms ?? launchPlatforms(input.notes));
+}
+
 /** Aggregate duplicate observations by UTC hour; unsampled hours remain absent. */
 export function hourlyRows(rows = [], cutoff = Infinity) {
   const groups = new Map();
+  const seen = new Set();
   for (const row of Array.isArray(rows) ? rows : []) {
     const stamp = Date.parse(row.from ?? row.at);
     if (!Number.isFinite(stamp) || stamp + HOUR > cutoff || typeof row.viewers !== 'number' || !Number.isFinite(row.viewers) || row.viewers < 0) continue;
     const hour = Math.floor(stamp / HOUR) * HOUR;
     const group = groups.get(hour) ?? { viewers: 0, channels: 0, weight: 0, channelWeight: 0 };
     const weight = positive(row.reads) ? Math.min(row.reads, 60) : 1;
+    const key = JSON.stringify([stamp, row.viewers, row.channels ?? null, weight]);
+    if (seen.has(key)) continue;
+    seen.add(key);
     group.viewers += weight * Math.max(1, row.viewers);
     group.weight += weight;
     if (positive(row.channels)) {
@@ -84,14 +99,14 @@ export function trainingRecords(input) {
   return records;
 }
 
-function targetFeatures(input) {
+export function targetFeatures(input) {
   const start = Date.parse(input.day_start);
   const checkpoint = Math.min(Date.parse(input.checkpoint), start + HOUR);
   const known = (Array.isArray(input.known) ? input.known : []).find(row => row.hour === 1 &&
     (!row.from || Date.parse(row.from) === start) && (!row.until || Date.parse(row.until) <= checkpoint));
   const anchor = positive(known?.viewers) ? clamp(known.viewers, 1, 1e9) : 1;
   const rows = hourlyRows(Array.isArray(input.history_hourly) && input.history_hourly.length ? input.history_hourly : input.history, checkpoint);
-  const meta = metadata(input.unlock ?? input.notes, input.platforms ?? input.game?.platforms ?? input.notes?.split(';')[0]);
+  const meta = targetMetadata(input);
   return { anchor, x: features(anchor, known?.channels, rows, start, meta), meta };
 }
 
@@ -159,11 +174,11 @@ function normalCDF(value) {
 }
 
 /** Cross-fitted predictive residual mixture; normal pseudo-observations stabilize small samples. */
-export function forecast(input, config = DEFAULT_CONFIG) {
+export function robustForecast(input, config = DEFAULT_CONFIG) {
   const records = trainingRecords(input);
   const target = targetFeatures(input);
   const residuals = records.map((record, index) => {
-    const others = records.filter((_, other) => other !== index);
+    const others = records.filter((candidate, other) => other !== index && identity(candidate.name) !== identity(record.name) && (!config.chronological || candidate.start < record.start));
     return record.outcomes.map((outcome, hour) => outcome == null ? null : outcome - location(others, record, hour, config));
   });
   return { hours: Array.from({ length: 23 }, (_, index) => {
@@ -191,6 +206,12 @@ export function forecast(input, config = DEFAULT_CONFIG) {
     });
     return { hour: hour + 1, q: quantiles };
   }) };
+}
+
+export function forecast(input, config) {
+  if (config) return robustForecast(input, config);
+  const selection = selectWidth(input, false, robustForecast);
+  return compress(robustForecast(input), targetMetadata(input), selection.config);
 }
 
 export function persistence(anchor) {
